@@ -1,0 +1,924 @@
+%% flyMountain_multiUAV_dynamic.m
+% 多路径多无人机规划，路径冲突检测，动态避障（PPLO优化策略整合）
+clear; clc; close all;
+
+%% 1. 环境参数 - 从CSV文件读取威胁区
+fprintf('正在从CSV文件加载威胁区数据...\n');
+data = readtable('data/uav_navigation_dataset.csv');
+
+% 提取检测到障碍物的点
+obstacleData = data(data.obstacle_detected == 1, :);
+fprintf('检测到%d个障碍物点\n', height(obstacleData));
+
+% 坐标转换参数
+R = 6371000; % 地球半径(米)
+deg2rad = pi/180;
+lat0 = mean(obstacleData.latitude);
+lon0 = mean(obstacleData.longitude);
+
+% 转换为直角坐标系 (东方向, 北方向, 高度)
+x = (obstacleData.longitude - lon0) * (R * cos(lat0*deg2rad) * deg2rad);
+y = (obstacleData.latitude - lat0) * (R * deg2rad);
+z = obstacleData.altitude;
+points = [x, y, z];
+
+% DBSCAN聚类分析
+eps = 15;       % 邻域半径(米)
+minPts = 3;     % 最小聚类点数
+labels = dbscan(points, eps, minPts);
+
+% 处理聚类结果
+uniqueLabels = unique(labels);
+uniqueLabels(uniqueLabels == -1) = []; % 移除噪声点
+threat = [];
+r = [];
+
+fprintf('聚类结果: %d个威胁区\n', length(uniqueLabels));
+for i = 1:length(uniqueLabels)
+    clusterIdx = (labels == uniqueLabels(i));
+    clusterPoints = points(clusterIdx, :);
+    
+    % 计算聚类中心
+    center = mean(clusterPoints, 1);
+    
+    % 计算聚类半径 (最大距离 + 安全裕量)
+    dists = sqrt(sum((clusterPoints - center).^2, 2));
+    radius = max(dists) + 8;
+    
+    threat = [threat; center];
+    r = [r; radius];
+    
+    fprintf('威胁区%d: 中心(%.1f, %.1f, %.1f), 半径%.1f米, 包含%d个点\n', ...
+            i, center(1), center(2), center(3), radius, sum(clusterIdx));
+end
+
+% 添加单独点作为小型威胁区
+noiseIdx = (labels == -1);
+if any(noiseIdx)
+    noisePoints = points(noiseIdx, :);
+    for i = 1:size(noisePoints, 1)
+        threat = [threat; noisePoints(i, :)];
+        r = [r; 5]; % 单独点使用小半径
+    end
+    fprintf('添加%d个单独点作为小型威胁区\n', sum(noiseIdx));
+end
+
+%% 2. 预设多条路径起终点及无人机数目
+pathsStart = [0, 0, 0;      50, 50, 0;    100, 100, 0]; % 三条路径起点
+pathsEnd   = [700, 700, 100; 600, 600, 80; 550, 650, 90]; % 终点
+uavCountPerPath = [3, 2, 1]; % 每条路径上无人机数目
+
+numPaths = size(pathsStart,1);
+totalUAVs = sum(uavCountPerPath);
+
+%% 3. 生成每条路径（确定性避障 + B样条）- 保留原始路径点
+allRoutePts = cell(numPaths,1);
+allSmoothPaths = cell(numPaths,1);
+pathLengths = zeros(numPaths,1); % 存储路径长度
+
+fprintf('正在生成初始路径...\n');
+for pIdx = 1:numPaths
+    % 生成避障路径点
+    nodes = [pathsStart(pIdx,:); generateTangentPoints(threat,r); pathsEnd(pIdx,:)];
+    N = size(nodes,1);
+    
+    % 构建路径点图
+    G = inf(N);
+    for i = 1:N-1
+        for j = i+1:N
+            if ~segmentIntersects(nodes(i,:), nodes(j,:), threat, r)
+                G(i,j) = norm(nodes(i,:)-nodes(j,:));
+            end
+        end
+    end
+
+    % Dijkstra搜索最短路径
+    [dist, prev] = dijkstra_shortest(G,1,N);
+    if isinf(dist)
+        error('路径 %d 无可行路径', pIdx);
+    end
+
+    % 重构路径
+    route = N;
+    while route(1) ~= 1
+        route = [prev(route(1)), route];
+    end
+    routePts = nodes(route,:);
+    allRoutePts{pIdx} = routePts;
+
+    % B样条平滑 - 保留原始路径点
+    M = size(routePts,1);
+    t = 1:M;
+    tq = linspace(1,M,150);
+    xs = spline(t, routePts(:,1).', tq);
+    ys = spline(t, routePts(:,2).', tq);
+    zs = spline(t, routePts(:,3).', tq);
+    smoothPath = [xs.', ys.', zs.'];
+    allSmoothPaths{pIdx} = smoothPath;
+    
+    % 计算路径长度
+    pathLengths(pIdx) = calculatePathLength(smoothPath);
+    fprintf('路径%d初始长度: %.2f米\n', pIdx, pathLengths(pIdx));
+end
+
+%% 3.5 路径优化（使用PPLO优化路径长度）
+fprintf('正在优化路径...\n');
+for pIdx = 1:numPaths
+    % 路径优化参数
+    popSize = 15;
+    maxIter = 40;
+    lb = -20; % 扰动范围下限
+    ub = 20;  % 扰动范围上限
+    dim = size(allRoutePts{pIdx}, 1) * 3; % 每个路径点有3个坐标
+    
+    % 路径优化目标函数
+    pathObjFunc = @(x) optimizePathCost(x, allRoutePts{pIdx}, threat, r);
+    
+    % 运行路径优化
+    [~, bestDelta] = PPLO_optimizer(popSize, maxIter, lb, ub, dim, pathObjFunc);
+    
+    % 应用优化结果
+    delta = reshape(bestDelta, [], 3);
+    optimizedPts = allRoutePts{pIdx} + delta(1:size(allRoutePts{pIdx},1),:);
+    
+    % 确保路径点安全
+    for i = 1:size(optimizedPts,1)-1
+        if segmentIntersects(optimizedPts(i,:), optimizedPts(i+1,:), threat, r)
+            % 如果不安全，使用原始路径点
+            optimizedPts = allRoutePts{pIdx};
+            fprintf('路径%d优化后不安全，使用原始路径\n', pIdx);
+            break;
+        end
+    end
+    
+    % 重新平滑路径
+    M = size(optimizedPts,1);
+    t = 1:M;
+    tq = linspace(1,M,150);
+    xs = spline(t, optimizedPts(:,1).', tq);
+    ys = spline(t, optimizedPts(:,2).', tq);
+    zs = spline(t, optimizedPts(:,3).', tq);
+    optimizedSmoothPath = [xs.', ys.', zs.'];
+    allSmoothPaths{pIdx} = optimizedSmoothPath;
+    
+    % 计算优化后路径长度
+    optimizedLength = calculatePathLength(optimizedSmoothPath);
+    fprintf('路径%d优化后长度: %.2f米 (缩短%.2f米)\n', pIdx, optimizedLength, ...
+            pathLengths(pIdx) - optimizedLength);
+end
+
+%% 4. 分配每架 UAV 的路径
+allUAVPaths = cell(totalUAVs,1);
+uavIdxGlobal = 0;
+for pIdx = 1:numPaths
+    nUAVs = uavCountPerPath(pIdx);
+    for i = 1:nUAVs
+        uavIdxGlobal = uavIdxGlobal + 1;
+        allUAVPaths{uavIdxGlobal} = allSmoothPaths{pIdx};
+    end
+end
+
+%% 5. 路径冲突检测
+safeDist = 15;
+numFrames = size(allUAVPaths{1},1);
+conflictMat = false(totalUAVs);
+conflictFrameMat = cell(totalUAVs);
+
+fprintf('正在检测路径冲突...\n');
+for i = 1:totalUAVs-1
+    for j = i+1:totalUAVs
+        distVec = vecnorm(allUAVPaths{i} - allUAVPaths{j}, 2, 2);
+        conflictFrames = find(distVec < safeDist);
+        if ~isempty(conflictFrames)
+            conflictMat(i,j) = true;
+            conflictMat(j,i) = true;
+            conflictFrameMat{i,j} = conflictFrames;
+            conflictFrameMat{j,i} = conflictFrames;
+            fprintf('UAV%d 与 UAV%d 在 %d 帧处存在冲突\n', i, j, length(conflictFrames));
+        end
+    end
+end
+
+%% 6. 基于PPLO策略的起飞调度优化（核心改进）
+fprintf('正在优化起飞调度...\n');
+% 初始化起飞延迟
+uavDelays = zeros(totalUAVs,1);
+frameOffsetPerPath = zeros(numPaths,1);
+
+% 优化参数
+popSize = 20;       % 种群大小
+maxIter = 500;       % 最大迭代次数
+lb = 0;             % 最小延迟
+ub = 300;           % 最大延迟
+dim = totalUAVs;    % 优化变量维度
+
+% 目标函数：最小化最大完成时间 + 冲突惩罚
+fitnessFunc = @(delays) evaluateSchedule(delays, allUAVPaths, conflictFrameMat, numFrames, safeDist);
+
+% 运行PPLO优化（记录收敛曲线）
+[bestFitness, bestDelays, convCurve] = PPLO_optimizer(popSize, maxIter, lb, ub, dim, fitnessFunc);
+
+fprintf('优化完成! 最佳适应度: %.2f\n', bestFitness);
+uavDelays = round(bestDelays); % 延迟时间为整数帧
+
+%% 7. 可视化
+figure(1); clf;
+
+% 1. 放大并居中 Figure 窗口（单位归一化）
+set(gcf, 'Units', 'normalized', 'Position', [0.1, 0.1, 0.8, 0.8]);
+
+% 2. 调整子图位置，让它占据更多空间
+ax = subplot(2,2,[1,3]);
+set(ax, 'Position', [0.05, 0.1, 0.65, 0.85]);  % [left bottom width height]
+
+hold(ax, 'on');
+grid(ax, 'on');
+axis(ax, 'equal');
+rotate3d(ax, 'on');
+xlabel(ax, 'X'); ylabel(ax, 'Y'); zlabel(ax, 'Z');
+view(ax, 3);
+title(ax, '多路径多无人机避障规划 + PPLO优化动态避障');
+
+
+% 彩色威胁区
+[xsph, ysph, zsph] = sphere(20);
+threatColors = rand(size(threat,1), 3);
+for i = 1:size(threat,1)
+    surf(threat(i,1)+r(i)*xsph, threat(i,2)+r(i)*ysph, threat(i,3)+r(i)*zsph,...
+        'EdgeColor','none', 'FaceAlpha',0.25, 'FaceColor',threatColors(i,:));
+end
+
+% 绘制原始路径点
+colors = lines(numPaths);
+for pIdx = 1:numPaths
+    plot3(allRoutePts{pIdx}(:,1), allRoutePts{pIdx}(:,2), allRoutePts{pIdx}(:,3), ...
+        'o-', 'LineWidth', 1.5, 'Color', colors(pIdx,:), ...
+        'MarkerFaceColor', colors(pIdx,:), 'MarkerSize', 6, ...
+        'DisplayName', sprintf('路径 %d 原始航点', pIdx));
+end
+
+% 绘制平滑路径和无人机
+uavColors = jet(totalUAVs);
+uavIdxGlobal = 0;
+for pIdx = 1:numPaths
+    nUAVs = uavCountPerPath(pIdx);
+    for i = 1:nUAVs
+        uavIdxGlobal = uavIdxGlobal + 1;
+        % 绘制平滑路径
+        plot3(allSmoothPaths{pIdx}(:,1), allSmoothPaths{pIdx}(:,2), allSmoothPaths{pIdx}(:,3),...
+            '--', 'LineWidth', 1.5, 'Color', uavColors(uavIdxGlobal,:), ...
+            'DisplayName', sprintf('UAV %d 平滑轨迹', uavIdxGlobal));
+        
+        % 标记起点
+        startP = pathsStart(pIdx,:);
+        plot3(startP(1), startP(2), startP(3), 's', 'MarkerSize',12, ...
+            'MarkerFaceColor', uavColors(uavIdxGlobal,:), ...
+            'MarkerEdgeColor', 'k', ...
+            'DisplayName', sprintf('UAV %d 起点', uavIdxGlobal));
+        
+        % 显示延迟时间
+        text(startP(1)+5, startP(2)+5, startP(3), ...
+            sprintf('Delay: %d', uavDelays(uavIdxGlobal)), ...
+            'FontSize', 9, 'Color', uavColors(uavIdxGlobal,:));
+    end
+end
+
+% 标记终点
+for pIdx = 1:numPaths
+    endP = pathsEnd(pIdx,:);
+    plot3(endP(1), endP(2), endP(3), 'p', 'MarkerSize',15, ...
+        'MarkerFaceColor', 'r', 'MarkerEdgeColor', 'k', ...
+        'DisplayName', '终点');
+end
+
+legend('Location','bestoutside');
+
+% 绘制收敛曲线
+figure(2); clf;
+
+% 1. 放大并居中 Figure 窗口（归一化坐标：[左 下 宽 高]）
+set(gcf, 'Units', 'normalized', 'Position', [0.15, 0.15, 0.7, 0.7]);
+
+% 2. 创建子图并让它占据更大区域
+ax = subplot(2,2,2);
+set(ax, 'Position', [0.1, 0.1, 0.8, 0.8]);  % [left bottom width height] 均为归一化比例
+
+hold(ax, 'on');
+grid(ax, 'on');
+plot(convCurve, 'b-', 'LineWidth', 1.5, 'MarkerSize', 4);
+xlabel('迭代次数');
+ylabel('最佳适应度');
+title('PPLO算法收敛曲线');
+set(ax, 'YScale', 'log');
+text(0.6, 0.9, sprintf('最终适应度: %.2f', bestFitness), ...
+     'Units', 'normalized', 'FontSize', 10);
+
+
+% 绘制延迟分布
+figure(3); clf;
+
+% 1. 放大并居中 Figure 窗口
+set(gcf, 'Units', 'normalized', 'Position', [0.1, 0.1, 0.8, 0.8]);
+
+% 2. 调整子图位置，让它占据更多空间并居中
+ax = subplot(2,2,4);
+set(ax, 'Position', [0.15, 0.15, 0.75, 0.75]);  % [left bottom width height]
+
+hold(ax, 'on');
+grid(ax, 'on');
+bar(uavDelays, 'FaceColor', [0.5, 0.8, 0.9]);
+xlabel(ax, '无人机编号');
+ylabel(ax, '延迟 (帧)');
+title(ax, '无人机起飞延迟分布');
+
+for i = 1:totalUAVs
+    text(ax, i, uavDelays(i), num2str(uavDelays(i)), ...
+        'HorizontalAlignment', 'center', ...
+        'VerticalAlignment', 'bottom');
+end
+
+
+%% 8. 增强动画演示
+figure(4); clf;
+set(gcf, 'Position', [200, 200, 1000, 800]);
+ax = axes;
+hold(ax, 'on'); grid(ax, 'on'); axis(ax, 'equal'); rotate3d(ax, 'on');
+xlabel(ax, 'X'); ylabel(ax, 'Y'); zlabel(ax, 'Z'); view(ax, 3);
+title(ax, '多无人机动态避障演示');
+set(ax, 'FontSize', 12);
+
+% 绘制威胁区
+for i = 1:size(threat,1)
+    surf(ax, threat(i,1)+r(i)*xsph, threat(i,2)+r(i)*ysph, threat(i,3)+r(i)*zsph,...
+        'EdgeColor','none', 'FaceAlpha',0.15, 'FaceColor',threatColors(i,:));
+end
+
+% 绘制路径
+for pIdx = 1:numPaths
+    plot3(ax, allSmoothPaths{pIdx}(:,1), allSmoothPaths{pIdx}(:,2), allSmoothPaths{pIdx}(:,3),...
+        '--', 'LineWidth', 1, 'Color', [0.5, 0.5, 0.5]);
+end
+
+% 创建无人机和安全区
+hUAVs = gobjects(totalUAVs,1);
+hSafeZones = gobjects(totalUAVs,1);
+hPaths = gobjects(totalUAVs,1);
+hConflictLines = gobjects(totalUAVs, totalUAVs);
+hTexts = gobjects(totalUAVs,1);
+
+% 安全区球体（缩小版）
+[sx, sy, sz] = sphere(10);
+safeZoneScale = safeDist * 0.8;
+
+for i = 1:totalUAVs
+    % 无人机标记
+    hUAVs(i) = plot3(ax, nan, nan, nan, ...
+        'o', 'MarkerSize', 10, 'MarkerFaceColor', uavColors(i,:), ...
+        'MarkerEdgeColor', 'k', 'LineWidth', 1.5);
+    
+    % 安全区
+    hSafeZones(i) = surf(ax, nan(size(sx)), nan(size(sy)), nan(size(sz)), ...
+        'EdgeColor', 'none', 'FaceAlpha', 0.2, 'FaceColor', uavColors(i,:));
+    
+    % 飞行路径
+    hPaths(i) = plot3(ax, nan, nan, nan, ...
+        '-', 'LineWidth', 1.5, 'Color', uavColors(i,:), 'LineStyle', ':');
+    
+    % 无人机编号文本
+    hTexts(i) = text(ax, nan, nan, nan, sprintf('%d', i), ...
+        'FontSize', 10, 'FontWeight', 'bold', 'Color', 'k', ...
+        'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom');
+end
+
+% 冲突线初始化
+for i = 1:totalUAVs
+    for j = i+1:totalUAVs
+        hConflictLines(i,j) = plot3(ax, [nan, nan], [nan, nan], [nan, nan], ...
+            'r-', 'LineWidth', 2);
+    end
+end
+
+% 记录每架无人机的位置历史
+posHistory = cell(totalUAVs,1);
+
+% 动画参数
+maxDelay = max(uavDelays);
+totalFrames = numFrames + maxDelay + 50; % 增加缓冲帧
+frameRate = 30; % 帧率
+delayTime = 0.05; % 帧间延迟
+
+% 冲突计数器
+conflictCount = 0;
+
+% 动画循环
+for frameIdx = 1:totalFrames
+    % 清除上一帧的冲突线
+    for i = 1:totalUAVs
+        for j = i+1:totalUAVs
+            set(hConflictLines(i,j), 'XData', [nan, nan], 'YData', [nan, nan], 'ZData', [nan, nan]);
+        end
+    end
+    
+    % 更新无人机位置
+    for uavIdx = 1:totalUAVs
+        idx = frameIdx - uavDelays(uavIdx);
+        
+        if idx < 1
+            pos = allUAVPaths{uavIdx}(1,:); % 尚未起飞
+        elseif idx > numFrames
+            pos = allUAVPaths{uavIdx}(end,:); % 已到达终点
+        else
+            pos = allUAVPaths{uavIdx}(round(idx),:); % 飞行中
+        end
+        
+        % 更新无人机位置
+        set(hUAVs(uavIdx), 'XData', pos(1), 'YData', pos(2), 'ZData', pos(3));
+        
+        % 更新安全区位置
+        set(hSafeZones(uavIdx), 'XData', pos(1) + safeZoneScale*sx, ...
+            'YData', pos(2) + safeZoneScale*sy, ...
+            'ZData', pos(3) + safeZoneScale*sz);
+        
+        % 更新无人机编号位置
+        set(hTexts(uavIdx), 'Position', [pos(1), pos(2), pos(3)+10]);
+        
+        % 更新飞行路径
+        if idx >= 1 && idx <= numFrames
+            posHistory{uavIdx} = [posHistory{uavIdx}; pos];
+            set(hPaths(uavIdx), 'XData', posHistory{uavIdx}(:,1), ...
+                'YData', posHistory{uavIdx}(:,2), ...
+                'ZData', posHistory{uavIdx}(:,3));
+        end
+    end
+    
+    % 检测并显示冲突
+    for i = 1:totalUAVs-1
+        for j = i+1:totalUAVs
+            posI = get(hUAVs(i), {'XData','YData','ZData'});
+            posJ = get(hUAVs(j), {'XData','YData','ZData'});
+            
+            if ~isempty(posI{1}) && ~isempty(posJ{1})
+                dist = norm([posI{1}, posI{2}, posI{3}] - [posJ{1}, posJ{2}, posJ{3}]);
+                
+                if dist < safeDist
+                    % 显示冲突线
+                    set(hConflictLines(i,j), 'XData', [posI{1}, posJ{1}], ...
+                        'YData', [posI{2}, posJ{2}], ...
+                        'ZData', [posI{3}, posJ{3}]);
+                    
+                    % 增加冲突计数器
+                    conflictCount = conflictCount + 1;
+                end
+            end
+        end
+    end
+    
+    % 显示当前帧信息
+    title(ax, sprintf('多无人机动态避障 - 帧: %d/%d (冲突次数: %d)', frameIdx, totalFrames, conflictCount));
+    drawnow;
+    
+    % 暂停控制
+    if delayTime > 0
+        pause(delayTime);
+    end
+    
+    % 按空格键暂停
+    if ~isempty(get(gcf, 'CurrentCharacter'))
+        pause;
+    end
+end
+
+%% 9. 性能分析
+% 计算每架无人机的飞行时间
+flightTimes = zeros(totalUAVs,1);
+for i = 1:totalUAVs
+    flightTimes(i) = numFrames + uavDelays(i);
+end
+
+% 显示结果
+fprintf('\n======= 性能分析 =======\n');
+fprintf('无人机 | 延迟(帧) | 总时间(帧) | 路径长度(m)\n');
+fprintf('----------------------------------------\n');
+
+uavIdxGlobal = 0;
+for pIdx = 1:numPaths
+    nUAVs = uavCountPerPath(pIdx);
+    pathLength = calculatePathLength(allSmoothPaths{pIdx});
+    
+    for i = 1:nUAVs
+        uavIdxGlobal = uavIdxGlobal + 1;
+        fprintf('%4d   | %6d  | %8d  | %.2f\n', ...
+            uavIdxGlobal, uavDelays(uavIdxGlobal), flightTimes(uavIdxGlobal), pathLength);
+    end
+end
+
+fprintf('----------------------------------------\n');
+fprintf('最大完成时间: %.2f 帧\n', max(flightTimes));
+fprintf('平均完成时间: %.2f 帧\n', mean(flightTimes));
+fprintf('总延迟时间: %.2f 帧\n', sum(uavDelays));
+fprintf('总冲突次数: %d\n', conflictCount);
+
+%% --- 辅助函数 ---
+function pts = generateTangentPoints(threat, r)
+    % 生成威胁区域的切点（8方向扩展）
+    delta = 15;
+    n = size(threat,1);
+    pts = zeros(n*8,3);
+    idx = 1;
+    angles = 0:pi/4:2*pi-pi/4; % 8个方向
+    
+    for k = 1:n
+        C = threat(k,:);
+        R = r(k) + delta;
+        
+        for a = angles
+            pts(idx,:)   = C + [R*cos(a), R*sin(a), 0];
+            idx = idx + 1;
+        end
+        
+        % 添加高度方向的点
+        pts(idx,:) = C + [0, 0, R];
+        pts(idx+1,:) = C + [0, 0, -R];
+        idx = idx + 2;
+    end
+end
+
+function flag = segmentIntersects(A, B, threat, r)
+    % 检测线段是否与威胁区相交
+    flag = false;
+    v = B - A;
+    len = norm(v);
+    if len == 0
+        return; % 起点和终点重合
+    end
+    v = v / len; % 单位化
+    
+    for k = 1:size(threat,1)
+        C = threat(k,:);
+        R = r(k);
+        
+        % 计算点到线段的最短距离
+        w = C - A;
+        proj = dot(w, v);
+        
+        if proj <= 0
+            dist = norm(C - A);
+        elseif proj >= len
+            dist = norm(C - B);
+        else
+            perp = w - proj*v;
+            dist = norm(perp);
+        end
+        
+        if dist < R
+            flag = true;
+            return;
+        end
+    end
+end
+
+function [dist, prev] = dijkstra_shortest(G, s, t)
+    % Dijkstra最短路径算法
+    n = size(G,1);
+    dist = inf(1,n); 
+    dist(s) = 0;
+    prev = zeros(1,n);
+    visited = false(1,n);
+    
+    for i = 1:n
+        % 找到未访问的最小距离节点
+        minDist = inf;
+        u = -1;
+        for j = 1:n
+            if ~visited(j) && dist(j) < minDist
+                minDist = dist(j);
+                u = j;
+            end
+        end
+        
+        if u == -1, break; end
+        if u == t, break; end % 找到目标节点
+        
+        visited(u) = true;
+        
+        % 更新邻居节点距离
+        for v = 1:n
+            if ~visited(v) && G(u,v) < inf
+                alt = dist(u) + G(u,v);
+                if alt < dist(v)
+                    dist(v) = alt;
+                    prev(v) = u;
+                end
+            end
+        end
+    end
+end
+
+function length = calculatePathLength(path)
+    % 计算路径长度
+    length = 0;
+    for i = 1:size(path,1)-1
+        length = length + norm(path(i,:) - path(i+1,:));
+    end
+end
+
+function fitness = evaluateSchedule(delays, allUAVPaths, conflictFrameMat, numFrames, safeDist)
+    % 评估调度方案的适应度
+    delays = max(0, round(delays)); % 确保延迟为非负整数
+    totalUAVs = numel(delays);
+    
+    % 1. 计算最大完成时间
+    flightTimes = zeros(totalUAVs,1);
+    for i = 1:totalUAVs
+        flightTimes(i) = numFrames + delays(i);
+    end
+    maxTime = max(flightTimes);
+    
+    % 2. 冲突检测
+    conflictPenalty = 0;
+    
+    for i = 1:totalUAVs-1
+        for j = i+1:totalUAVs
+            % 只检查已知冲突对
+            if ~isempty(conflictFrameMat{i,j})
+                % 计算两架无人机的实际时间线
+                startI = delays(i);
+                endI = delays(i) + numFrames;
+                startJ = delays(j);
+                endJ = delays(j) + numFrames;
+                
+                % 重叠时间段
+                overlapStart = max(startI, startJ);
+                overlapEnd = min(endI, endJ);
+                
+                if overlapStart < overlapEnd
+                    % 检查重叠帧
+                    for t = overlapStart:overlapEnd
+                        % 计算当前帧在各自路径中的位置
+                        frameI = t - delays(i);
+                        frameJ = t - delays(j);
+                        
+                        % 边界检查
+                        if frameI >= 1 && frameI <= numFrames && ...
+                           frameJ >= 1 && frameJ <= numFrames
+                            % 使用round确保整数索引
+                            posI = allUAVPaths{i}(round(frameI),:);
+                            posJ = allUAVPaths{j}(round(frameJ),:);
+                            dist = norm(posI - posJ);
+                            
+                            if dist < safeDist
+                                % 冲突惩罚（距离越近惩罚越大）
+                                conflictPenalty = conflictPenalty + 1000 * (safeDist - dist);
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    % 3. 总适应度 = 最大完成时间 + 冲突惩罚
+    fitness = maxTime + conflictPenalty;
+end
+
+function cost = optimizePathCost(delta, pathPts, threat, r)
+    % 路径优化目标函数
+    delta = reshape(delta, [], 3);
+    newPts = pathPts + delta(1:size(pathPts,1),:);
+    
+    % 计算新路径长度
+    pathLength = 0;
+    for i = 1:size(newPts,1)-1
+        pathLength = pathLength + norm(newPts(i,:) - newPts(i+1,:));
+    end
+    
+    % 安全性检查
+    safetyPenalty = 0;
+    for i = 1:size(newPts,1)-1
+        if segmentIntersects(newPts(i,:), newPts(i+1,:), threat, r)
+            safetyPenalty = safetyPenalty + 1000; % 大惩罚
+        end
+    end
+    
+    % 路径平滑度惩罚
+    smoothPenalty = 0;
+    for i = 2:size(newPts,1)-1
+        v1 = newPts(i,:) - newPts(i-1,:);
+        v2 = newPts(i+1,:) - newPts(i,:);
+        angle = acos(dot(v1,v2)/(norm(v1)*norm(v2)));
+        smoothPenalty = smoothPenalty + abs(angle - pi/2);
+    end
+    
+    % 总成本 = 路径长度 + 安全惩罚 + 平滑惩罚
+    cost = pathLength + safetyPenalty + 0.1*smoothPenalty;
+end
+
+function [bestFitness, bestSolution, convCurve] = PPLO_optimizer(popSize, maxIter, lb, ub, dim, fitnessFunc)
+    % 基于PPLO策略的优化器（返回收敛曲线）
+    convCurve = zeros(1, maxIter); % 存储收敛曲线
+    
+    % 初始化参数
+    inertia = 0.9;          % 初始惯性权重
+    c1 = 1.5;               % 个体学习因子
+    c2 = 1.7;               % 社会学习因子
+    
+    % Sobol序列初始化（改进空间分布）
+    sobolSeq = net(sobolset(dim), popSize);
+    population = lb + sobolSeq .* (ub - lb);
+    
+    % 初始化速度和适应度
+    velocity = zeros(popSize, dim);
+    fitness = inf(popSize, 1);
+    personalBest = population;
+    personalBestFitness = inf(popSize, 1);
+    
+    % 全局最佳
+    [globalBestFitness, gIdx] = min(personalBestFitness);
+    globalBest = personalBest(gIdx, :);
+    
+    % 精英池
+    eliteSize = min(5, popSize);
+    elitePool = repmat(struct('solution', [], 'fitness', inf), 1, eliteSize);
+    
+    % 迭代优化
+    for iter = 1:maxIter
+        % 非线性参数衰减
+        w = inertia * (1 - (iter/maxIter)^2);
+        c1_iter = c1 * exp(-2*iter/maxIter);
+        c2_iter = c2 * (1 - exp(-3*iter/maxIter));
+        
+        % 评估当前种群
+        for i = 1:popSize
+            fitness(i) = fitnessFunc(population(i,:));
+            
+            % 更新个体最优
+            if fitness(i) < personalBestFitness(i)
+                personalBest(i,:) = population(i,:);
+                personalBestFitness(i) = fitness(i);
+                
+                % 更新全局最优
+                if fitness(i) < globalBestFitness
+                    globalBest = population(i,:);
+                    globalBestFitness = fitness(i);
+                end
+            end
+        end
+        
+        % 记录收敛曲线
+        convCurve(iter) = globalBestFitness;
+        
+        % 更新精英池
+        eliteSolutions = reshape([elitePool.solution], dim, [])';
+        eliteFitness = [elitePool.fitness];
+        
+        if isempty(eliteSolutions)
+            allSolutions = personalBest;
+            allFitness = personalBestFitness';
+        else
+            allSolutions = [eliteSolutions; personalBest];
+            allFitness = [eliteFitness, personalBestFitness'];
+        end
+
+        [~, sortedIdx] = sort(allFitness);
+        elitePool = repmat(struct('solution', [], 'fitness', inf), 1, eliteSize);
+
+        for i = 1:eliteSize
+            elitePool(i).fitness = allFitness(sortedIdx(i));
+            elitePool(i).solution = allSolutions(sortedIdx(i),:);
+        end
+
+        
+        % 速度更新
+        for i = 1:popSize
+            % 拟牛顿法修正（后期优化）
+            if iter > 0.7*maxIter
+                % 使用有限差分计算梯度
+                baseFitness = fitnessFunc(population(i,:));
+                grad = zeros(1, dim);
+                delta = 0.01 * (ub - lb);
+                
+                for d = 1:dim
+                    perturbed = population(i,:);
+                    perturbed(d) = perturbed(d) + delta;
+                    perturbedFitness = fitnessFunc(perturbed);
+                    grad(d) = (perturbedFitness - baseFitness) / delta;
+                end
+                
+                newtonDir = -grad / norm(grad);
+                velocity(i,:) = 0.3*velocity(i,:) + 0.7*newtonDir*(ub-lb);
+            else
+                % PSO标准更新
+                r1 = rand(1, dim);
+                r2 = rand(1, dim);
+                cognitive = c1_iter * r1 .* (personalBest(i,:) - population(i,:));
+                social = c2_iter * r2 .* (globalBest - population(i,:));
+                velocity(i,:) = w*velocity(i,:) + cognitive + social;
+            end
+            
+            % 速度边界限制
+            velocity(i,:) = min(max(velocity(i,:), -0.1*(ub-lb)), 0.1*(ub-lb));
+            
+            % 位置更新
+            population(i,:) = population(i,:) + velocity(i,:);
+            
+            % 位置边界限制
+            population(i,:) = min(max(population(i,:), lb), ub);
+            
+            % 反向学习策略
+            if rand() < 0.2
+                opposite = lb + ub - population(i,:);
+                oppFitness = fitnessFunc(opposite);
+                if oppFitness < fitness(i)
+                    population(i,:) = opposite;
+                    fitness(i) = oppFitness;
+                end
+            end
+        end
+        
+        % 精英引导（每5代）
+        if mod(iter, 5) == 0
+            for i = 1:popSize
+                if rand() < 0.3
+                    eliteIdx = randi(eliteSize);
+                    alpha = 0.3 + 0.4*rand;
+                    population(i,:) = alpha*population(i,:) + ...
+                                     (1-alpha)*elitePool(eliteIdx).solution;
+                end
+            end
+        end
+        
+        % 显示迭代信息
+        if mod(iter, 10) == 0 || iter == 1
+            fprintf('迭代 %3d: 最佳适应度 = %.2f\n', iter, globalBestFitness);
+        end
+    end
+    
+    bestFitness = globalBestFitness;
+    bestSolution = globalBest;
+end
+
+function labels = dbscan(X, epsilon, MinPts)
+    % DBSCAN聚类算法实现
+    % X: 数据点矩阵 (n×d)
+    % epsilon: 邻域半径
+    % MinPts: 形成核心对象的最小邻域点数
+    % labels: 聚类标签 (-1表示噪声)
+    
+    n = size(X, 1);
+    labels = zeros(n, 1); % 0表示未访问
+    clusterCount = 0;
+    
+    % 计算距离矩阵
+    D = pdist2(X, X);
+    
+    for i = 1:n
+        if labels(i) ~= 0
+            continue; % 已访问过
+        end
+        
+        % 获取epsilon邻域内的点
+        neighbors = find(D(i, :) <= epsilon);
+        
+        if numel(neighbors) < MinPts
+            labels(i) = -1; % 标记为噪声
+            continue;
+        end
+        
+        clusterCount = clusterCount + 1;
+        labels(i) = clusterCount;
+        
+        % 移除非核心点
+        neighbors(neighbors == i) = [];
+        seedSet = neighbors(:);
+        
+        j = 1;
+        while j <= numel(seedSet)
+            idx = seedSet(j);
+            
+            if labels(idx) == -1
+                labels(idx) = clusterCount; % 将噪声重新归类为边界点
+            end
+            
+            if labels(idx) ~= 0
+                j = j + 1;
+                continue;
+            end
+            
+            labels(idx) = clusterCount;
+            
+            % 获取当前点的邻域
+            newNeighbors = find(D(idx, :) <= epsilon);
+            
+            if numel(newNeighbors) >= MinPts
+                % 添加未访问的邻居
+                for k = 1:numel(newNeighbors)
+                    if labels(newNeighbors(k)) == 0
+                        seedSet = [seedSet; newNeighbors(k)];
+                    end
+                end
+            end
+            
+            j = j + 1;
+        end
+    end
+end
